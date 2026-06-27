@@ -1,6 +1,6 @@
 // Service Worker for 章鱼喷墨机 PWA
 // 每次更新时修改这个版本号，强制更新缓存
-const CACHE_VERSION = '5';
+const CACHE_VERSION = '9';
 const CACHE_NAME = `zhangyu-pwa-v${CACHE_VERSION}`;
 const urlsToCache = [
   './',

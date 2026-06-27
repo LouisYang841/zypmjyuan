@@ -779,9 +779,29 @@
                     console.log('数据库升级到版本3，添加通用资源Blob存储');
                 });
 
-                // 使用 OPFS (Origin Private File System)
+                // --- 同步判定存储后端（学习兔k机：不需要异步 init）---
                 this.rootHandle = null;
                 this.initialized = false;
+                this.opfsAvailable = null;
+                
+                // OPFS 仅在 HTTPS 或 localhost 的安全上下文可用
+                // 同步检查：window.isSecureContext + 协议
+                const isSecure = window.isSecureContext === true;
+                const isHttps = window.location.protocol === 'https:';
+                const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+                const canTryOpfs = isSecure && (isHttps || isLocalhost);
+                
+                if (canTryOpfs) {
+                    // 可能支持 OPFS，异步检测
+                    console.log('🔍 检测 OPFS 可用性...');
+                    this.opfsAvailable = null;
+                    this.init(); // 异步检测，完成后设置 initialized
+                } else {
+                    // HTTP 非 localhost 场景：直接用 Dexie
+                    console.log('⚠️ 非安全上下文，使用 IndexedDB (Dexie) 作为存储后端');
+                    this.opfsAvailable = false;
+                    this.initialized = false; // 明确标记 OPFS 不可用
+                }
 
                 // LRU缓存配置
                 this.cache = new Map();
@@ -795,32 +815,39 @@
                     operationTimes: [],
                     memoryUsage: 0
                 };
-
-                // 初始化 OPFS
-                this.init();
             }
 
             // 初始化 OPFS
             async init() {
+                // 已经初始化过就不再重试
+                if (this.opfsAvailable !== null) {
+                    return;
+                }
                 try {
                     if (!navigator.storage || !navigator.storage.getDirectory) {
                         throw new Error('OPFS 不支持，浏览器版本过低');
                     }
                     this.rootHandle = await navigator.storage.getDirectory();
                     this.initialized = true;
+                    this.opfsAvailable = true;
                     console.log('✅ OPFS 初始化成功');
                 } catch (error) {
                     console.error('❌ OPFS 初始化失败:', error);
-                    // 降级到 localStorage
-                    console.warn('⚠️ 降级使用 localStorage');
+                    // 降级到 IndexedDB (Dexie)
+                    console.warn('⚠️ 降级使用 IndexedDB (Dexie)');
                     this.initialized = false;
+                    this.opfsAvailable = false;
                 }
             }
 
             // 确保初始化完成
             async ensureInitialized() {
-                if (!this.initialized) {
+                if (!this.initialized && this.opfsAvailable === null) {
                     await this.init();
+                }
+                if (!this.initialized && this.opfsAvailable === false) {
+                    // OPFS 终局不可用(HTTP)，不抛异常，调用方应检查 this.initialized
+                    return;
                 }
                 if (!this.initialized) {
                     throw new Error('存储系统未初始化');
@@ -845,6 +872,12 @@
 
             // 写入文件
             async writeFile(dirName, fileName, data) {
+                // OPFS 不可用时降级到 Dexie (IndexedDB)
+                if (!this.initialized) {
+                    const key = `${dirName}/${fileName}`;
+                    await this.db.storage.put({ key, value: data, timestamp: Date.now() });
+                    return true;
+                }
                 try {
                     const dirHandle = await this.getOrCreateDirectory(dirName);
                     const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
@@ -860,6 +893,12 @@
 
             // 读取文件
             async readFile(dirName, fileName) {
+                // OPFS 不可用时从 Dexie (IndexedDB) 读取
+                if (!this.initialized) {
+                    const key = `${dirName}/${fileName}`;
+                    const record = await this.db.storage.get(key);
+                    return record ? record.value : null;
+                }
                 try {
                     const dirHandle = await this.getOrCreateDirectory(dirName);
                     const fileHandle = await dirHandle.getFileHandle(fileName);
@@ -876,6 +915,12 @@
 
             // 删除文件
             async deleteFile(dirName, fileName) {
+                // OPFS 不可用时从 Dexie (IndexedDB) 删除
+                if (!this.initialized) {
+                    const key = `${dirName}/${fileName}`;
+                    await this.db.storage.delete(key);
+                    return true;
+                }
                 try {
                     const dirHandle = await this.getOrCreateDirectory(dirName);
                     await dirHandle.removeEntry(fileName);
@@ -888,8 +933,15 @@
                 }
             }
 
-            // 列出目录中的所有文件
+            // 列出目录内容
             async listFiles(dirName) {
+                // OPFS 不可用时从 Dexie 列出文件
+                if (!this.initialized) {
+                    const records = await this.db.storage.toArray();
+                    return records
+                        .filter(r => r.key.startsWith(`${dirName}/`))
+                        .map(r => r.key.replace(`${dirName}/`, ''));
+                }
                 try {
                     const dirHandle = await this.getOrCreateDirectory(dirName);
                     const files = [];
@@ -1259,9 +1311,17 @@
             async clearAll() {
                 const startTime = Date.now();
                 try {
+                    // OPFS 不可用时，清空 Dexie storage 表
+                    if (!this.initialized) {
+                        await this.db.storage.clear();
+                        this.cache.clear();
+                        console.log('✅ 所有数据已清空 (Dexie 降级模式)');
+                        return true;
+                    }
+                    
                     await this.ensureInitialized();
                     
-                    // 删除所有目录
+                    // 删除所有 OPFS 目录
                     const directories = ['storage', 'messages', 'metadata', 'images', 'assets'];
                     
                     for (const dirName of directories) {
@@ -1276,8 +1336,15 @@
                         }
                     }
                     
+                    // 同时清空 Dexie storage 表（可能有旧降级数据残留）
+                    try {
+                        await this.db.storage.clear();
+                    } catch (dexError) {
+                        console.warn('清空 Dexie storage 表失败:', dexError);
+                    }
+                    
                     this.cache.clear();
-                    console.log('所有数据已清空');
+                    console.log('所有数据已清空 (OPFS + Dexie)');
 
                     return true;
                 } catch (error) {
@@ -1289,6 +1356,13 @@
 
             // 获取所有存储的键
             async getAllKeys() {
+                // OPFS 不可用时从 Dexie 读取所有键
+                if (!this.initialized) {
+                    const records = await this.db.storage.toArray();
+                    return records
+                        .filter(r => r.key.startsWith('storage/'))
+                        .map(r => r.key.replace('storage/', '').replace('.json', ''));
+                }
                 try {
                     const files = await this.listFiles('storage');
                     return files.map(file => file.replace('.json', ''));
@@ -1317,22 +1391,35 @@
                     // 获取消息目录
                     let messageSize = 0;
                     let chunkCount = 0;
-                    try {
-                        const messagesDir = await this.rootHandle.getDirectoryHandle('messages');
-                        for await (const chatDir of messagesDir.values()) {
-                            if (chatDir.kind === 'directory') {
-                                for await (const file of chatDir.values()) {
-                                    if (file.kind === 'file') {
-                                        const fileHandle = await chatDir.getFileHandle(file.name);
-                                        const fileObj = await fileHandle.getFile();
-                                        messageSize += fileObj.size;
-                                        chunkCount++;
+                    if (this.rootHandle) {
+                        try {
+                            const messagesDir = await this.rootHandle.getDirectoryHandle('messages');
+                            for await (const chatDir of messagesDir.values()) {
+                                if (chatDir.kind === 'directory') {
+                                    for await (const file of chatDir.values()) {
+                                        if (file.kind === 'file') {
+                                            const fileHandle = await chatDir.getFileHandle(file.name);
+                                            const fileObj = await fileHandle.getFile();
+                                            messageSize += fileObj.size;
+                                            chunkCount++;
+                                        }
                                     }
                                 }
                             }
+                        } catch (error) {
+                            // messages 目录不存在
                         }
-                    } catch (error) {
-                        // messages 目录不存在
+                    } else {
+                        // Dexie 降级模式：从 storage 表统计消息分块
+                        try {
+                            const allRecords = await this.db.storage.toArray();
+                            const msgRecords = allRecords.filter(r => r.key.startsWith('messages/'));
+                            chunkCount = msgRecords.length;
+                            messageSize = msgRecords.reduce((sum, r) =>
+                                sum + (typeof r.value === 'string' ? r.value.length : JSON.stringify(r.value).length), 0);
+                        } catch (dexError) {
+                            console.warn('统计 Dexie 消息大小失败:', dexError);
+                        }
                     }
 
                     const totalSize = storageSize + messageSize;
@@ -1431,36 +1518,70 @@
                     }
                     
                     // 2. 清理孤立的消息分块
-                    try {
-                        const messagesDir = await this.rootHandle.getDirectoryHandle('messages');
-                        for await (const chatDir of messagesDir.values()) {
-                            if (chatDir.kind === 'directory') {
-                                const dirName = chatDir.name;
+                    if (this.rootHandle) {
+                        try {
+                            const messagesDir = await this.rootHandle.getDirectoryHandle('messages');
+                            for await (const chatDir of messagesDir.values()) {
+                                if (chatDir.kind === 'directory') {
+                                    const dirName = chatDir.name;
+                                    const parts = dirName.split('_');
+                                    if (parts.length >= 2) {
+                                        const chatType = parts[0];
+                                        const chatId = parts.slice(1).join('_');
+                                        
+                                        let isOrphan = false;
+                                        if (chatType === 'private' && !activeCharacterIds.has(chatId)) {
+                                            isOrphan = true;
+                                        } else if (chatType === 'group' && !activeGroupIds.has(chatId)) {
+                                            isOrphan = true;
+                                        }
+                                        
+                                        if (isOrphan) {
+                                            // 删除整个目录
+                                            for await (const file of chatDir.values()) {
+                                                await chatDir.removeEntry(file.name);
+                                                deletedCount++;
+                                            }
+                                            await messagesDir.removeEntry(dirName);
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (error) {
+                            // messages 目录不存在
+                        }
+                    } else {
+                        // Dexie 降级模式：从 storage 表清理孤立消息分块
+                        try {
+                            const allRecords = await this.db.storage.toArray();
+                            const msgPrefixes = new Set(
+                                allRecords
+                                    .filter(r => r.key.startsWith('messages/'))
+                                    .map(r => {
+                                        const parts = r.key.split('/');
+                                        return parts.length >= 2 ? parts[1] : null; // private_xxx or group_xxx
+                                    })
+                                    .filter(Boolean)
+                            );
+                            for (const dirName of msgPrefixes) {
                                 const parts = dirName.split('_');
                                 if (parts.length >= 2) {
                                     const chatType = parts[0];
                                     const chatId = parts.slice(1).join('_');
-                                    
                                     let isOrphan = false;
-                                    if (chatType === 'private' && !activeCharacterIds.has(chatId)) {
-                                        isOrphan = true;
-                                    } else if (chatType === 'group' && !activeGroupIds.has(chatId)) {
-                                        isOrphan = true;
-                                    }
+                                    if (chatType === 'private' && !activeCharacterIds.has(chatId)) isOrphan = true;
+                                    else if (chatType === 'group' && !activeGroupIds.has(chatId)) isOrphan = true;
                                     
                                     if (isOrphan) {
-                                        // 删除整个目录
-                                        for await (const file of chatDir.values()) {
-                                            await chatDir.removeEntry(file.name);
-                                            deletedCount++;
-                                        }
-                                        await messagesDir.removeEntry(dirName);
+                                        await this.clearChatMessages(chatId, chatType);
+                                        deletedCount++;
+                                        console.log(`清理孤立消息: ${chatId} (${chatType})`);
                                     }
                                 }
                             }
+                        } catch (dexError) {
+                            console.warn('Dexie 清理孤立消息失败:', dexError);
                         }
-                    } catch (error) {
-                        // messages 目录不存在
                     }
 
                     // 3. 清理孤立的缓存对象
@@ -1604,6 +1725,10 @@
             // 计算当前存储大小
             async calculateStorageSize() {
                 try {
+                    if (!navigator.storage || !navigator.storage.estimate) {
+                        console.log('📊 存储信息: navigator.storage.estimate 不可用（非安全上下文），跳过');
+                        return { usage: 0, quota: 0, percentage: 0 };
+                    }
                     const estimate = await navigator.storage.estimate();
                     const usage = estimate.usage || 0;
                     const quota = estimate.quota || 0;
@@ -1777,7 +1902,14 @@
             }
         }
 
-        const loadData = async () => {
+const loadData = async () => {
+            // 🔧 等待存储系统初始化完成（constructor 中的 init() 是异步的）
+            if (dataStorage.opfsAvailable === null) {
+                console.log('⏳ 等待存储系统初始化...');
+                await dataStorage.init();
+                console.log('✅ 存储系统初始化完成, OPFS可用:', dataStorage.opfsAvailable);
+            }
+
             // 首先尝试数据迁移
             await dataStorage.migrateFromOldStorage();
 

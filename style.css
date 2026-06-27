@@ -40,7 +40,7 @@
         .phone-screen {
             width: 100%;
             max-width: 420px;
-            height: 100vh;
+            height: 100dvh;
             max-height: 850px;
             background-color: var(--white-color);
             box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
@@ -49,6 +49,13 @@
             position: relative;
             display: flex;
             flex-direction: column;
+        }
+        
+        /* 100dvh fallback for older browsers */
+        @supports not (height: 100dvh) {
+            .phone-screen {
+                height: 100vh;
+            }
         }
         
         /* PWA全屏模式适配 */
